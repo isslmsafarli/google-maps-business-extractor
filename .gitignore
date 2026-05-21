@@ -6,3 +6,4 @@ env/
 .gosom_work/
 output/
 *.log
+*.tmp

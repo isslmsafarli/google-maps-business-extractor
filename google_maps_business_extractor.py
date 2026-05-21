@@ -15,18 +15,13 @@ import re
 import subprocess
 import sys
 import tempfile
+import zipfile
 from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
 from urllib.parse import quote_plus
-
-try:
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill
-    from openpyxl.utils import get_column_letter
-except ImportError:  # pragma: no cover - handled at runtime with clear error.
-    Workbook = None
+from xml.sax.saxutils import escape
 
 
 SOCIAL_DOMAINS = {
@@ -282,32 +277,73 @@ def write_json(rows: list[Business], path: Path) -> None:
 
 
 def write_excel(rows: list[Business], path: Path) -> None:
-    if Workbook is None:
-        raise RuntimeError("openpyxl is required for Excel export. Run: pip install -r requirements.txt")
+    workbook_rows = [OUTPUT_COLUMNS]
+    workbook_rows.extend([[asdict(row)[column] for column in OUTPUT_COLUMNS] for row in rows])
 
-    workbook = Workbook()
-    sheet = workbook.active
-    sheet.title = "Businesses"
+    sheet_rows = []
+    for row_index, row in enumerate(workbook_rows, start=1):
+        cells = []
+        for column_index, value in enumerate(row, start=1):
+            ref = f"{excel_column(column_index)}{row_index}"
+            style = ' s="1"' if row_index == 1 else ""
+            if isinstance(value, (int, float)) and value is not None:
+                cells.append(f'<c r="{ref}"{style}><v>{value}</v></c>')
+            else:
+                text = escape("" if value is None else str(value))
+                cells.append(f'<c r="{ref}" t="inlineStr"{style}><is><t>{text}</t></is></c>')
+        sheet_rows.append(f'<row r="{row_index}">{"".join(cells)}</row>')
 
-    header_fill = PatternFill("solid", fgColor="1F2937")
-    header_font = Font(color="FFFFFF", bold=True)
+    worksheet_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>
+  <sheetData>{"".join(sheet_rows)}</sheetData>
+</worksheet>'''
 
-    sheet.append(OUTPUT_COLUMNS)
-    for cell in sheet[1]:
-        cell.fill = header_fill
-        cell.font = header_font
+    files = {
+        "[Content_Types].xml": '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+</Types>''',
+        "_rels/.rels": '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>''',
+        "xl/workbook.xml": '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="Businesses" sheetId="1" r:id="rId1"/></sheets>
+</workbook>''',
+        "xl/_rels/workbook.xml.rels": '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>''',
+        "xl/styles.xml": '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <fonts count="2"><font/><font><b/><color rgb="FFFFFFFF"/></font></fonts>
+  <fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF1F2937"/><bgColor indexed="64"/></patternFill></fill></fills>
+  <borders count="1"><border/></borders>
+  <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+  <cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/></cellXfs>
+  <cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
+</styleSheet>''',
+        "xl/worksheets/sheet1.xml": worksheet_xml,
+    }
 
-    for row in rows:
-        sheet.append([asdict(row)[column] for column in OUTPUT_COLUMNS])
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for filename, content in files.items():
+            archive.writestr(filename, content)
 
-    for column_index, column_name in enumerate(OUTPUT_COLUMNS, start=1):
-        values = [str(column_name)]
-        values.extend(str(asdict(row)[column_name] or "") for row in rows)
-        width = min(max(len(value) for value in values) + 2, 60)
-        sheet.column_dimensions[get_column_letter(column_index)].width = width
 
-    sheet.freeze_panes = "A2"
-    workbook.save(path)
+def excel_column(index: int) -> str:
+    letters = ""
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        letters = chr(65 + remainder) + letters
+    return letters
 
 
 def export_files(rows: list[Business], output_dir: Path, query: str) -> dict[str, Path]:

@@ -23,7 +23,6 @@ Rows are skipped when they have no website, only a social/profile link, duplicat
 
 - Python 3.10+
 - Docker
-- Python dependency: `openpyxl`
 
 ## Install Docker
 
@@ -38,12 +37,6 @@ docker --version
 ```
 
 The first run may take longer because Docker needs to download the `gosom/google-maps-scraper` image.
-
-## Install Python Dependencies
-
-```bash
-pip install -r requirements.txt
-```
 
 ## Example Command
 
