@@ -1,6 +1,6 @@
 # Google Maps Business Extractor
 
-Standalone Google Maps business extractor for portfolio demos. It runs the free `gosom/google-maps-scraper` Docker tool, filters the results, removes duplicates, and exports clean CSV, JSON, and Excel files.
+Standalone Google Maps business extractor for portfolio demos. It uses Playwright to open Google Maps in a headless browser, scroll the results list, visit each business listing, filter the results, remove duplicates, and export clean CSV, JSON, and Excel files.
 
 ## What It Exports
 
@@ -22,21 +22,24 @@ Rows are skipped when they have no website, only a social/profile link, duplicat
 ## Requirements
 
 - Python 3.10+
-- Docker
+- Playwright
+- Chromium browser installed by Playwright
 
-## Install Docker
+## Install
 
-Docker is required because the scraper runs `gosom/google-maps-scraper` inside a container.
-
-1. Install Docker Desktop from https://www.docker.com/products/docker-desktop/
-2. Start Docker Desktop.
-3. Confirm Docker works:
+Install the Python package:
 
 ```bash
-docker --version
+pip install -r requirements.txt
 ```
 
-The first run may take longer because Docker needs to download the `gosom/google-maps-scraper` image.
+Install Chromium for Playwright:
+
+```bash
+playwright install chromium
+```
+
+No Docker and no API key are required.
 
 ## Example Command
 
@@ -52,10 +55,10 @@ output/dentists_london.json
 output/dentists_london.xlsx
 ```
 
-You can also control scrape depth and output directory:
+You can also control result count and output directory:
 
 ```bash
-python google_maps_business_extractor.py "dentists London" --depth 3 --output-dir results
+python google_maps_business_extractor.py "dentists London" --max-results 25 --output-dir results
 ```
 
 ## Summary Output
@@ -87,4 +90,4 @@ Sample CSV data is also available at [`docs/sample_dentists_london.csv`](docs/sa
 
 ## Notes
 
-This project is a clean standalone demo. It does not use SQLite, outreach tracking, lead statuses, or website reachability checks.
+This project is a clean standalone demo. It does not use Docker, SQLite, outreach tracking, lead statuses, website reachability checks, or a paid API key.

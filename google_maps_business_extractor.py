@@ -2,8 +2,8 @@
 """
 Standalone Google Maps business extractor.
 
-Runs gosom/google-maps-scraper via Docker, filters out unusable rows, removes
-duplicates, and exports clean CSV, JSON, and Excel files.
+Uses Playwright to search Google Maps, collect listing links from the results
+feed, visit each listing, filter unusable rows, and export CSV, JSON, and Excel.
 """
 
 from __future__ import annotations
@@ -12,16 +12,24 @@ import argparse
 import csv
 import json
 import re
-import subprocess
 import sys
-import tempfile
+import time
 import zipfile
 from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
-from urllib.parse import quote_plus
+from urllib.parse import parse_qsl, quote_plus, urlencode, urlsplit, urlunsplit
 from xml.sax.saxutils import escape
+
+try:
+    from playwright.sync_api import Browser, Page, TimeoutError as PlaywrightTimeoutError
+    from playwright.sync_api import sync_playwright
+except ImportError:  # pragma: no cover - gives users a clean setup message.
+    Browser = None
+    Page = None
+    PlaywrightTimeoutError = TimeoutError
+    sync_playwright = None
 
 
 SOCIAL_DOMAINS = {
@@ -60,6 +68,8 @@ REQUIRED_FIELDS = [
     "address",
     "phone",
     "website",
+    "rating",
+    "review_count",
     "category",
     "google_maps_link",
 ]
@@ -75,6 +85,12 @@ class Business:
     review_count: int | None
     category: str
     google_maps_link: str
+
+
+@dataclass(frozen=True)
+class ResultLink:
+    name: str
+    url: str
 
 
 def normalize_website(url: str | None) -> str | None:
@@ -101,27 +117,44 @@ def slugify_query(query: str) -> str:
     return slug or "google_maps_results"
 
 
-def first_value(row: dict[str, str], *keys: str) -> str:
-    for key in keys:
-        value = row.get(key)
-        if value is not None and str(value).strip():
-            return str(value).strip()
-    return ""
+def clean_label(label: str | None, prefix: str) -> str:
+    if not label:
+        return ""
+    cleaned = re.sub(rf"^{re.escape(prefix)}\s*:?\s*", "", label.strip(), flags=re.I)
+    if cleaned == label.strip() and ":" in cleaned:
+        label_prefix, value = cleaned.split(":", 1)
+        if len(label_prefix) <= 24:
+            cleaned = value
+    return cleaned.strip()
 
 
-def parse_float(value: str) -> float | None:
+def force_english_maps_url(url: str) -> str:
+    parts = urlsplit(url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query["hl"] = "en"
+    query["gl"] = "us"
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+def parse_float(value: str | None) -> float | None:
     if not value:
         return None
+    match = re.search(r"\d+(?:[.,]\d+)?", value)
+    if not match:
+        return None
     try:
-        return float(str(value).strip())
+        return float(match.group(0).replace(",", "."))
     except ValueError:
         return None
 
 
-def parse_int(value: str) -> int | None:
+def parse_int(value: str | None) -> int | None:
     if not value:
         return None
-    cleaned = re.sub(r"[^\d]", "", str(value))
+    match = re.search(r"[\d,.]+", value)
+    if not match:
+        return None
+    cleaned = re.sub(r"[^\d]", "", match.group(0))
     if not cleaned:
         return None
     try:
@@ -130,104 +163,225 @@ def parse_int(value: str) -> int | None:
         return None
 
 
-def build_google_maps_link(row: dict[str, str], business_name: str, address: str) -> str:
-    explicit = first_value(
-        row,
-        "google_maps_link",
-        "maps_link",
-        "map_link",
-        "link",
-        "url",
-        "place_url",
-        "reviews_link",
-    )
-    if explicit:
-        return explicit
-
-    cid = first_value(row, "cid", "place_id", "data_id")
-    if cid:
-        return f"https://www.google.com/maps?cid={quote_plus(cid)}"
-
-    query = " ".join(part for part in [business_name, address] if part)
-    return f"https://www.google.com/maps/search/?api=1&query={quote_plus(query)}" if query else ""
+def require_playwright() -> None:
+    if sync_playwright is None:
+        raise RuntimeError(
+            "Playwright is not installed. Run: pip install -r requirements.txt "
+            "and then: playwright install chromium"
+        )
 
 
-def run_scraper(query: str, work_dir: Path, depth: int = 5, inactivity: str = "3m") -> Path:
-    """Run gosom scraper via Docker and return the generated results.csv path."""
-    work_dir.mkdir(parents=True, exist_ok=True)
-    queries_file = work_dir / "queries.txt"
-    results_file = work_dir / "results.csv"
-
-    queries_file.write_text(query + "\n", encoding="utf-8")
-    if results_file.exists():
-        results_file.unlink()
-    results_file.touch()
-
-    cmd = [
-        "docker",
-        "run",
-        "--rm",
-        "-v",
-        f"{queries_file}:/queries",
-        "-v",
-        f"{results_file}:/results",
-        "gosom/google-maps-scraper",
-        "-depth",
-        str(depth),
-        "-input",
-        "/queries",
-        "-results",
-        "/results",
-        "-exit-on-inactivity",
-        inactivity,
+def accept_consent_if_present(page: Page) -> None:
+    selectors = [
+        "button:has-text('Accept all')",
+        "button:has-text('I agree')",
+        "button:has-text('Accept')",
+        "form[action*='consent'] button",
     ]
+    for selector in selectors:
+        try:
+            button = page.locator(selector).first
+            if button.count() > 0 and button.is_visible(timeout=1000):
+                button.click(timeout=2000)
+                page.wait_for_timeout(1500)
+                return
+        except PlaywrightTimeoutError:
+            continue
 
-    print(f"[extract] running gosom: query={query!r} depth={depth}")
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
-        stderr_tail = (proc.stderr or "")[-1000:]
-        raise RuntimeError(f"gosom Docker run failed with exit code {proc.returncode}\n{stderr_tail}")
 
-    return results_file
-
-
-def parse_results(results_file: Path, fallback_category: str) -> list[Business]:
-    """Parse gosom results.csv into normalized business records."""
-    if not results_file.exists() or results_file.stat().st_size == 0:
-        return []
-
+def search_maps(page: Page, query: str) -> None:
+    url = f"https://www.google.com/maps/search/{quote_plus(query)}?hl=en&gl=us"
+    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    accept_consent_if_present(page)
     try:
-        csv.field_size_limit(sys.maxsize)
-    except OverflowError:
-        csv.field_size_limit(2**31 - 1)
+        page.wait_for_selector("div[role='feed'], h1", timeout=20000)
+    except PlaywrightTimeoutError:
+        page.wait_for_timeout(3000)
 
-    businesses: list[Business] = []
-    with results_file.open(newline="", encoding="utf-8", errors="replace") as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
-            business_name = first_value(row, "title", "name", "business", "business_name")
-            address = first_value(row, "address", "complete_address", "full_address")
-            phone = first_value(row, "phone", "phone_number", "telephone")
-            website = first_value(row, "website", "site", "url")
-            category = first_value(row, "category", "type", "main_category") or fallback_category
-            rating = parse_float(first_value(row, "review_rating", "rating", "google_rating"))
-            review_count = parse_int(first_value(row, "review_count", "reviews", "number_of_reviews"))
-            maps_link = build_google_maps_link(row, business_name, address)
 
-            businesses.append(
-                Business(
-                    business_name=business_name,
-                    address=address,
-                    phone=phone,
-                    website=website,
-                    rating=rating,
-                    review_count=review_count,
-                    category=category,
-                    google_maps_link=maps_link,
-                )
-            )
+def collect_result_links(page: Page, max_results: int, scroll_rounds: int) -> list[ResultLink]:
+    links: dict[str, ResultLink] = {}
+    stable_rounds = 0
+    previous_count = 0
 
-    return businesses
+    for _ in range(scroll_rounds):
+        listing_links = page.locator("a[href*='/maps/place/']")
+        count = listing_links.count()
+
+        for index in range(count):
+            anchor = listing_links.nth(index)
+            try:
+                href = anchor.get_attribute("href", timeout=1000)
+                label = anchor.get_attribute("aria-label", timeout=1000) or ""
+                title = anchor.get_attribute("title", timeout=1000) or ""
+                text = anchor.inner_text(timeout=1000) or ""
+            except PlaywrightTimeoutError:
+                continue
+
+            name = (label or title or text).strip()
+            if not href or not name or "/maps/place/" not in href:
+                continue
+            if name.lower() in {"website", "directions", "save", "share"}:
+                continue
+            links.setdefault(href, ResultLink(name=name, url=href))
+            if len(links) >= max_results:
+                return list(links.values())
+
+        if len(links) == previous_count:
+            stable_rounds += 1
+        else:
+            stable_rounds = 0
+        previous_count = len(links)
+        if stable_rounds >= 4:
+            break
+
+        scroll_results_feed(page)
+        page.wait_for_timeout(1200)
+
+    return list(links.values())[:max_results]
+
+
+def scroll_results_feed(page: Page) -> None:
+    feed = page.locator("div[role='feed']").first
+    try:
+        if feed.count() > 0:
+            feed.evaluate("(el) => { el.scrollTop = el.scrollHeight; }", timeout=3000)
+            return
+    except PlaywrightTimeoutError:
+        pass
+    page.mouse.wheel(0, 3500)
+
+
+def text_from_first(page: Page, selectors: Iterable[str], timeout: int = 1200) -> str:
+    for selector in selectors:
+        locator = page.locator(selector).first
+        try:
+            if locator.count() > 0:
+                text = locator.inner_text(timeout=timeout).strip()
+                if text:
+                    return text
+        except PlaywrightTimeoutError:
+            continue
+    return ""
+
+
+def attr_from_first(page: Page, selectors: Iterable[str], attr: str, timeout: int = 1200) -> str:
+    for selector in selectors:
+        locator = page.locator(selector).first
+        try:
+            if locator.count() > 0:
+                value = locator.get_attribute(attr, timeout=timeout)
+                if value and value.strip():
+                    return value.strip()
+        except PlaywrightTimeoutError:
+            continue
+    return ""
+
+
+def aria_value(page: Page, selectors: Iterable[str], prefix: str) -> str:
+    label = attr_from_first(page, selectors, "aria-label")
+    return clean_label(label, prefix)
+
+
+def extract_rating(page: Page) -> float | None:
+    text = text_from_first(page, ["span.MW4etd", "div.F7nice span[aria-hidden='true']"])
+    rating = parse_float(text)
+    if rating is not None:
+        return rating
+
+    aria = attr_from_first(page, ["div.F7nice"], "aria-label")
+    return parse_float(aria)
+
+
+def extract_review_count(page: Page) -> int | None:
+    text = text_from_first(page, ["span.UY7F9", "button[aria-label*='reviews']"])
+    count = parse_int(text)
+    if count is not None:
+        return count
+
+    aria = attr_from_first(page, ["button[aria-label*='reviews']", "span[aria-label*='reviews']"], "aria-label")
+    return parse_int(aria)
+
+
+def extract_business(page: Page, result: ResultLink) -> Business:
+    page.goto(force_english_maps_url(result.url), wait_until="domcontentloaded", timeout=60000)
+    try:
+        page.wait_for_selector("h1, button[data-item-id='address']", timeout=15000)
+    except PlaywrightTimeoutError:
+        page.wait_for_timeout(2500)
+
+    name = text_from_first(page, ["h1.DUwDvf", "h1"], timeout=3000) or result.name
+    address = aria_value(
+        page,
+        ["button[data-item-id='address']", "button[aria-label^='Address:']"],
+        "Address",
+    )
+    phone = aria_value(
+        page,
+        ["button[data-item-id^='phone:tel:']", "button[aria-label^='Phone:']"],
+        "Phone",
+    )
+    website = attr_from_first(
+        page,
+        ["a[data-item-id='authority']", "a[aria-label^='Website:']", "a[href^='http']:has-text('Website')"],
+        "href",
+    )
+    category = text_from_first(page, ["button.DkEaL", "button[jsaction*='category']", "div[jsaction*='category']"])
+    rating = extract_rating(page)
+    review_count = extract_review_count(page)
+
+    return Business(
+        business_name=name,
+        address=address,
+        phone=phone,
+        website=website,
+        rating=rating,
+        review_count=review_count,
+        category=category,
+        google_maps_link=page.url,
+    )
+
+
+def scrape_google_maps(
+    query: str,
+    max_results: int,
+    scroll_rounds: int,
+    headless: bool,
+    slow_mo: int,
+) -> list[Business]:
+    require_playwright()
+
+    with sync_playwright() as playwright:
+        browser: Browser = playwright.chromium.launch(headless=headless, slow_mo=slow_mo)
+        context = browser.new_context(
+            locale="en-US",
+            timezone_id="America/New_York",
+            viewport={"width": 1440, "height": 1100},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+        )
+        page = context.new_page()
+        try:
+            search_maps(page, query)
+            result_links = collect_result_links(page, max_results=max_results, scroll_rounds=scroll_rounds)
+            print(f"[extract] collected {len(result_links)} result links")
+
+            businesses = []
+            for index, result in enumerate(result_links, start=1):
+                print(f"[extract] opening {index}/{len(result_links)}: {result.name}")
+                try:
+                    businesses.append(extract_business(page, result))
+                except PlaywrightTimeoutError:
+                    continue
+                time.sleep(0.4)
+            return businesses
+        finally:
+            context.close()
+            browser.close()
 
 
 def validate_and_filter(rows: Iterable[Business]) -> tuple[list[Business], Counter]:
@@ -237,7 +391,7 @@ def validate_and_filter(rows: Iterable[Business]) -> tuple[list[Business], Count
 
     for row in rows:
         data = asdict(row)
-        missing_required = [field for field in REQUIRED_FIELDS if not data.get(field)]
+        missing_required = [field for field in REQUIRED_FIELDS if data.get(field) in ("", None)]
         if missing_required:
             skipped[f"missing_{missing_required[0]}"] += 1
             continue
@@ -377,31 +531,24 @@ def print_summary(raw_count: int, exported_count: int, skipped: Counter, paths: 
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Export Google Maps businesses to CSV, JSON, and Excel.")
+    parser = argparse.ArgumentParser(description="Extract Google Maps businesses to CSV, JSON, and Excel.")
     parser.add_argument("query", help='Search query, e.g. "dentists London"')
-    parser.add_argument("--depth", type=int, default=5, help="gosom scrape depth (default: 5)")
-    parser.add_argument("--inactivity", default="3m", help="gosom exit-on-inactivity value (default: 3m)")
+    parser.add_argument("--max-results", type=int, default=40, help="Maximum listing pages to open (default: 40)")
+    parser.add_argument("--scroll-rounds", type=int, default=18, help="Result-list scroll attempts (default: 18)")
     parser.add_argument("--output-dir", default="output", help="Directory for exported files (default: output)")
-    parser.add_argument(
-        "--keep-work-dir",
-        action="store_true",
-        help="Keep temporary gosom files for debugging.",
-    )
+    parser.add_argument("--headed", action="store_true", help="Run browser visibly instead of headless")
+    parser.add_argument("--slow-mo", type=int, default=0, help="Slow Playwright actions by N milliseconds")
     args = parser.parse_args()
 
-    output_dir = Path(args.output_dir).resolve()
-
-    if args.keep_work_dir:
-        work_dir = Path(".gosom_work").resolve()
-        results_file = run_scraper(args.query, work_dir, depth=args.depth, inactivity=args.inactivity)
-        raw_rows = parse_results(results_file, fallback_category=args.query)
-    else:
-        with tempfile.TemporaryDirectory(prefix="gmaps_extractor_") as tmp:
-            results_file = run_scraper(args.query, Path(tmp), depth=args.depth, inactivity=args.inactivity)
-            raw_rows = parse_results(results_file, fallback_category=args.query)
-
+    raw_rows = scrape_google_maps(
+        query=args.query,
+        max_results=args.max_results,
+        scroll_rounds=args.scroll_rounds,
+        headless=not args.headed,
+        slow_mo=args.slow_mo,
+    )
     exported, skipped = validate_and_filter(raw_rows)
-    paths = export_files(exported, output_dir, args.query)
+    paths = export_files(exported, Path(args.output_dir).resolve(), args.query)
     print_summary(len(raw_rows), len(exported), skipped, paths)
     return 0
 

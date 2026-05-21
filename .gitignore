@@ -4,6 +4,7 @@ __pycache__/
 venv/
 env/
 .gosom_work/
+.test_output/
 output/
 *.log
 *.tmp
