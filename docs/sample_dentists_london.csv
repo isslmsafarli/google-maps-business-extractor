@@ -1,0 +1,4 @@
+business_name,address,phone,website,rating,review_count,category,google_maps_link
+London Dental Studio,"27 Example Street, London","+44 20 7946 0101",https://londondentalstudio.example,4.8,214,Dentist,https://www.google.com/maps/search/?api=1&query=London+Dental+Studio+27+Example+Street+London
+Smile Clinic London,"14 Sample Road, London","+44 20 7946 0202",https://smilecliniclondon.example,4.6,156,Dental clinic,https://www.google.com/maps/search/?api=1&query=Smile+Clinic+London+14+Sample+Road+London
+City Dentists,"8 Demo Avenue, London","+44 20 7946 0303",https://citydentists.example,4.7,89,Dentist,https://www.google.com/maps/search/?api=1&query=City+Dentists+8+Demo+Avenue+London
